@@ -90,46 +90,247 @@ namespace QUpdater
 
         private string GetInstalledVersion()
         {
-            string[] registryPaths = {
-                @"SOFTWARE\WOW6432Node\qBittorrent",
-                @"SOFTWARE\qBittorrent"
-            };
+            // 1) Try direct version from dedicated qBittorrent keys (both 64/32-bit, HKLM/HKCU)
+            string directVersion = TryReadQbittorrentVersionFromRegistry();
+            if (!string.IsNullOrWhiteSpace(directVersion))
+                return directVersion;
 
-            foreach (var path in registryPaths)
+            // 2) Try to resolve the executable path from registry (App Paths / Uninstall entries)
+            string exePath = TryGetQbittorrentExePathFromRegistry();
+            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
             {
-                try
-                {
-                    using (var key = Registry.LocalMachine.OpenSubKey(path))
-                    {
-                        if (key != null)
-                        {
-                            var version = key.GetValue("Version") as string;
-                            if (!string.IsNullOrEmpty(version))
-                                return version;
-                        }
-                    }
-                }
-                catch { }
+                var versionFromExe = TryGetVersionFromExecutable(exePath);
+                if (!string.IsNullOrWhiteSpace(versionFromExe))
+                    return versionFromExe;
             }
 
-            string[] programPaths = {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "qBittorrent", "qbittorrent.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "qBittorrent", "qbittorrent.exe")
+            // 3) Probe common install locations across ALL fixed drives (e.g., D:\Program Files\...)
+            exePath = ProbeCommonInstallLocationsAcrossDrives();
+            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
+            {
+                var versionFromExe = TryGetVersionFromExecutable(exePath);
+                if (!string.IsNullOrWhiteSpace(versionFromExe))
+                    return versionFromExe;
+            }
+
+            return null;
+        }
+
+        private string TryReadQbittorrentVersionFromRegistry()
+        {
+            string[] keyPaths = new[]
+            {
+                "SOFTWARE\\qBittorrent",
+                "SOFTWARE\\WOW6432Node\\qBittorrent"
             };
 
-            foreach (var path in programPaths)
+            // Check both HKLM and HKCU in both 64-bit and 32-bit views
+            RegistryHive[] hives = new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser };
+            RegistryView[] views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var hive in hives)
             {
-                if (File.Exists(path))
+                foreach (var view in views)
                 {
                     try
                     {
-                        var versionInfo = FileVersionInfo.GetVersionInfo(path);
-                        return $"{versionInfo.FileMajorPart}.{versionInfo.FileMinorPart}.{versionInfo.FileBuildPart}";
+                        using (var baseKey = RegistryKey.OpenBaseKey(hive, view))
+                        {
+                            foreach (var path in keyPaths)
+                            {
+                                using (var key = baseKey.OpenSubKey(path))
+                                {
+                                    if (key == null) continue;
+                                    var version = key.GetValue("Version") as string;
+                                    if (!string.IsNullOrWhiteSpace(version))
+                                        return version;
+                                }
+                            }
+                        }
                     }
                     catch { }
                 }
             }
 
+            return null;
+        }
+
+        private string TryGetQbittorrentExePathFromRegistry()
+        {
+            // Prefer App Paths which typically holds the absolute path to the executable
+            string appPath = TryReadAppPaths("qbittorrent.exe");
+            if (!string.IsNullOrWhiteSpace(appPath))
+                return appPath;
+
+            // Fallback: search Uninstall entries for DisplayIcon or InstallLocation
+            var uninstallProbe = TryReadFromUninstall();
+            if (!string.IsNullOrWhiteSpace(uninstallProbe) && File.Exists(uninstallProbe))
+                return uninstallProbe;
+
+            return null;
+        }
+
+        private string TryReadAppPaths(string exeName)
+        {
+            string keyPath = $"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{exeName}";
+            RegistryHive[] hives = new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser };
+            RegistryView[] views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var hive in hives)
+            {
+                foreach (var view in views)
+                {
+                    try
+                    {
+                        using (var baseKey = RegistryKey.OpenBaseKey(hive, view))
+                        using (var key = baseKey.OpenSubKey(keyPath))
+                        {
+                            if (key == null) continue;
+                            var defaultValue = key.GetValue(null) as string; // (Default)
+                            if (!string.IsNullOrWhiteSpace(defaultValue) && File.Exists(defaultValue))
+                                return defaultValue;
+
+                            var pathValue = key.GetValue("Path") as string;
+                            if (!string.IsNullOrWhiteSpace(pathValue))
+                            {
+                                var candidate = Path.Combine(pathValue, exeName);
+                                if (File.Exists(candidate))
+                                    return candidate;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            return null;
+        }
+
+        private string TryReadFromUninstall()
+        {
+            string[] uninstallRoots = new[]
+            {
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+            };
+
+            RegistryHive[] hives = new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser };
+            RegistryView[] views = new[] { RegistryView.Registry64, RegistryView.Registry32 };
+
+            foreach (var hive in hives)
+            {
+                foreach (var view in views)
+                {
+                    foreach (var root in uninstallRoots)
+                    {
+                        try
+                        {
+                            using (var baseKey = RegistryKey.OpenBaseKey(hive, view))
+                            using (var uninstallKey = baseKey.OpenSubKey(root))
+                            {
+                                if (uninstallKey == null) continue;
+                                foreach (var subKeyName in uninstallKey.GetSubKeyNames())
+                                {
+                                    using (var subKey = uninstallKey.OpenSubKey(subKeyName))
+                                    {
+                                        if (subKey == null) continue;
+                                        var displayName = subKey.GetValue("DisplayName") as string;
+                                        if (string.IsNullOrWhiteSpace(displayName) || displayName.IndexOf("qbittorrent", StringComparison.OrdinalIgnoreCase) < 0)
+                                            continue;
+
+                                        // Found a qBittorrent entry; try to get version if needed
+                                        var displayVersion = subKey.GetValue("DisplayVersion") as string;
+                                        if (!string.IsNullOrWhiteSpace(displayVersion))
+                                        {
+                                            // Return version via separate call if needed, but we mainly want path
+                                        }
+
+                                        // Prefer InstallLocation when available
+                                        var installLocation = subKey.GetValue("InstallLocation") as string;
+                                        if (!string.IsNullOrWhiteSpace(installLocation))
+                                        {
+                                            var candidate = Path.Combine(installLocation, "qbittorrent.exe");
+                                            if (File.Exists(candidate)) return candidate;
+                                        }
+
+                                        // Next try DisplayIcon which often points directly to exe (may include ,0 suffix)
+                                        var displayIcon = subKey.GetValue("DisplayIcon") as string;
+                                        if (!string.IsNullOrWhiteSpace(displayIcon))
+                                        {
+                                            var cleaned = displayIcon;
+                                            var commaIdx = cleaned.IndexOf(',');
+                                            if (commaIdx >= 0) cleaned = cleaned.Substring(0, commaIdx);
+                                            cleaned = cleaned.Trim('"');
+                                            if (File.Exists(cleaned)) return cleaned;
+                                        }
+
+                                        // As a final hint, UninstallString may live next to the exe
+                                        var uninstallString = subKey.GetValue("UninstallString") as string;
+                                        if (!string.IsNullOrWhiteSpace(uninstallString))
+                                        {
+                                            var pathCandidate = uninstallString.Trim('"');
+                                            try
+                                            {
+                                                var directory = Path.GetDirectoryName(pathCandidate);
+                                                if (!string.IsNullOrWhiteSpace(directory))
+                                                {
+                                                    var exeCandidate = Path.Combine(directory, "qbittorrent.exe");
+                                                    if (File.Exists(exeCandidate)) return exeCandidate;
+                                                }
+                                            }
+                                            catch { }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private string ProbeCommonInstallLocationsAcrossDrives()
+        {
+            try
+            {
+                foreach (var drive in DriveInfo.GetDrives())
+                {
+                    try
+                    {
+                        if (drive.DriveType != DriveType.Fixed || !drive.IsReady) continue;
+                        var root = drive.RootDirectory.FullName;
+
+                        string[] relativePaths = new[]
+                        {
+                            Path.Combine("Program Files", "qBittorrent", "qbittorrent.exe"),
+                            Path.Combine("Program Files (x86)", "qBittorrent", "qbittorrent.exe")
+                        };
+
+                        foreach (var rel in relativePaths)
+                        {
+                            var candidate = Path.Combine(root, rel);
+                            if (File.Exists(candidate)) return candidate;
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        private string TryGetVersionFromExecutable(string exePath)
+        {
+            try
+            {
+                var versionInfo = FileVersionInfo.GetVersionInfo(exePath);
+                return $"{versionInfo.FileMajorPart}.{versionInfo.FileMinorPart}.{versionInfo.FileBuildPart}";
+            }
+            catch { }
             return null;
         }
 
